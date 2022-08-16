@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
+	ycsdk "github.com/yandex-cloud/go-sdk"
+	"github.com/yandex-cloud/go-sdk/iamkey"
 
 	"github.com/sputnik-systems/prom-dns-http-sd/pkg/storage"
 	"github.com/sputnik-systems/prom-dns-http-sd/pkg/storage/yandexcloud"
@@ -25,21 +27,33 @@ type SDConfig struct {
 
 type SDConfigs []SDConfig
 
-var mu sync.Mutex
-var config *storage.Config
-var client storage.Client
-var responseData map[string]SDConfigs
+type params struct {
+	mu           sync.Mutex
+	config       *storage.Config
+	client       storage.Client
+	responseData map[string]SDConfigs
 
-var configFilePath = flag.String("config-path", "", "application config file path")
-var ycAuthJsonFilePath = flag.String("yc-auth-json-file-path", "", "Yandex.Cloud iam.json file path")
-var dataUpdateInterval = flag.String("data-update-interval", "5m", "Interval between targets data updating")
+	flags flags
+}
+
+type flags struct {
+	configFilePath, ycAuthJsonFilePath, dataUpdateInterval *string
+}
+
+var p = params{
+	flags: flags{
+		configFilePath:     flag.String("config-path", "", "application config file path"),
+		ycAuthJsonFilePath: flag.String("yc-auth-json-file-path", "", "Yandex.Cloud iam.json file path"),
+		dataUpdateInterval: flag.String("data-update-interval", "1h", "Interval between targets data updating"),
+	},
+}
 
 func Run() error {
 	flag.Parse()
 
 	ctx := context.Background()
 
-	interval, err := time.ParseDuration(*dataUpdateInterval)
+	interval, err := time.ParseDuration(*p.flags.dataUpdateInterval)
 	if err != nil {
 		return errors.New("incorrect duration format")
 	}
@@ -51,13 +65,17 @@ func Run() error {
 		go configFileUpdater(ctx)
 	}
 
+	http.HandleFunc("/healthz", healthCheck)
 	http.HandleFunc("/", giveResponse)
 
 	return http.ListenAndServe(":8080", nil)
 }
 
+func healthCheck(w http.ResponseWriter, r *http.Request) {
+}
+
 func giveResponse(w http.ResponseWriter, r *http.Request) {
-	if body, ok := responseData[r.URL.Path]; ok {
+	if body, ok := p.responseData[r.URL.Path]; ok {
 		resp, err := json.Marshal(body)
 		if err != nil {
 			w.WriteHeader(404)
@@ -80,7 +98,7 @@ func configFileUpdater(ctx context.Context) {
 	}
 	defer watcher.Close()
 
-	err = watcher.Add(*configFilePath)
+	err = watcher.Add(*p.flags.configFilePath)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -95,15 +113,10 @@ func configFileUpdater(ctx context.Context) {
 			if event.Has(fsnotify.Write) {
 				log.Println("modified file:", event.Name)
 
-				config, err = storage.GetConfig(*configFilePath)
-				if err != nil {
-					log.Printf("failed to get config: %s", err)
+				if err := updateConfigAndClient(ctx); err != nil {
+					log.Printf("failed to update config and client: %s", err)
 				}
 
-				client, err = yandexcloud.NewClient(ctx, "./iam.json", config)
-				if err != nil {
-					log.Printf("failed to initialize client: %s", err)
-				}
 			}
 		case err, ok := <-watcher.Errors:
 			if !ok {
@@ -116,13 +129,13 @@ func configFileUpdater(ctx context.Context) {
 }
 
 func responseDataUpdater(ctx context.Context) {
-	zones, err := client.ListZones(ctx, config.Zones...)
+	zones, err := p.client.ListZones(ctx, p.config.Zones...)
 	if err != nil {
 		log.Printf("failed to list zones: %s", err)
 	}
 
 	sds := make(map[string]SDConfigs)
-	for _, rule := range config.Rules {
+	for _, rule := range p.config.Rules {
 		if _, ok := sds[rule.Path]; !ok {
 			sds[rule.Path] = make(SDConfigs, 0)
 		}
@@ -145,24 +158,17 @@ func responseDataUpdater(ctx context.Context) {
 		}
 	}
 
-	mu.Lock()
-	responseData = sds
-	mu.Unlock()
+	p.mu.Lock()
+	p.responseData = sds
+	p.mu.Unlock()
 }
 
 func responseDataUpdateTicker(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	var err error
-	config, err = storage.GetConfig(*configFilePath)
-	if err != nil {
-		log.Printf("failed to get config: %s", err)
-	}
-
-	client, err = yandexcloud.NewClient(ctx, *ycAuthJsonFilePath, config)
-	if err != nil {
-		log.Printf("failed to initialize client: %s", err)
+	if err := updateConfigAndClient(ctx); err != nil {
+		log.Printf("failed to update config and client: %s", err)
 	}
 
 	responseDataUpdater(ctx)
@@ -173,4 +179,46 @@ func responseDataUpdateTicker(ctx context.Context, interval time.Duration) {
 			responseDataUpdater(ctx)
 		}
 	}
+}
+
+func updateConfigAndClient(ctx context.Context) error {
+	var err error
+
+	p.mu.Lock()
+
+	p.config, err = storage.GetConfig(*p.flags.configFilePath)
+	if err != nil {
+		return fmt.Errorf("failed to get config: %w", err)
+	}
+
+	var creds ycsdk.Credentials
+	switch {
+	case *p.flags.ycAuthJsonFilePath != "":
+		key, err := iamkey.ReadFromJSONFile(*p.flags.ycAuthJsonFilePath)
+		if err != nil {
+			return err
+		}
+
+		if creds, err = ycsdk.ServiceAccountKey(key); err != nil {
+			return err
+		}
+	default:
+		creds = ycsdk.InstanceServiceAccount()
+	}
+
+	sdk, err := ycsdk.Build(ctx, ycsdk.Config{
+		Credentials: creds,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to build yc sdk: %w", err)
+	}
+
+	p.client, err = yandexcloud.NewClient(ctx, sdk, p.config)
+	if err != nil {
+		return fmt.Errorf("failed to initialize client: %w", err)
+	}
+
+	p.mu.Unlock()
+
+	return nil
 }

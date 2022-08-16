@@ -6,9 +6,8 @@ import (
 	"regexp"
 
 	dnsv1 "github.com/yandex-cloud/go-genproto/yandex/cloud/dns/v1"
-	"github.com/yandex-cloud/go-sdk"
+	ycsdk "github.com/yandex-cloud/go-sdk"
 	"github.com/yandex-cloud/go-sdk/gen/dns"
-	"github.com/yandex-cloud/go-sdk/iamkey"
 
 	"github.com/sputnik-systems/prom-dns-http-sd/pkg/storage"
 )
@@ -29,25 +28,11 @@ type Record struct {
 	record *dnsv1.RecordSet
 }
 
-func NewClient(ctx context.Context, filepath string, config *storage.Config) (storage.Client, error) {
+func NewClient(ctx context.Context, sdk *ycsdk.SDK, config *storage.Config) (storage.Client, error) {
 	folderIds, err := getConfigFolderIds(config)
 	if err != nil {
 		return nil, err
 	}
-
-	key, err := iamkey.ReadFromJSONFile(filepath)
-	if err != nil {
-		return nil, err
-	}
-
-	creds, err := ycsdk.ServiceAccountKey(key)
-	if err != nil {
-		return nil, err
-	}
-
-	sdk, err := ycsdk.Build(ctx, ycsdk.Config{
-		Credentials: creds,
-	})
 
 	return &Client{
 		folderIds: folderIds,

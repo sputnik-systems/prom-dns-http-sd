@@ -1,6 +1,6 @@
 module github.com/sputnik-systems/prom-dns-http-sd
 
-go 1.18
+go 1.19
 
 require (
 	github.com/fsnotify/fsnotify v1.5.5-0.20220810173357-fb07f82ddf75
