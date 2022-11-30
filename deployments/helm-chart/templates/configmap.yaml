@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "prom-dns-http-sd.fullname" . }}
+  labels:
+    {{- include "prom-dns-http-sd.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    ---
+    provider:
+      type: {{ .Values.provider.type }}
+      metadata:
+        {{- .Values.provider.metadata | nindent 8 }}
+
+    {{- with .Values.rules }}
+    rules:
+    {{- toYaml . | nindent 6 }}
+    {{- end }}
